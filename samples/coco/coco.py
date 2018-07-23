@@ -338,6 +338,50 @@ def build_coco_results(dataset, image_ids, rois, class_ids, scores, masks):
             results.append(result)
     return results
 
+def visualize_coco(model, dataset,):
+    import matplotlib.pyplot as plt
+
+    for i, image_id in enumerate(dataset.image_ids[args.limit_start_idx:args.limit_start_idx + args.limit]):
+        image, image_meta, gt_class_id, gt_bbox, gt_mask =\
+            modellib.load_image_gt(dataset, config, image_id)
+
+        info = dataset.image_info[image_id]
+        title = "image ID: {}.{} ({}) {}; {}x{}".format(info["path"], info["id"], image_id,
+                                                        dataset.image_reference(image_id), image.shape[0], image.shape[1])
+        print(args.limit_start_idx, i, image_id, info["path"])
+        plt.figure(figsize=(16 * 2, 16))
+        ax = plt.subplot(1, 2, 1)
+        plt.imshow(image)
+        plt.title(title)
+
+        class_names = [""] * len(dataset.class_names) if args.hide_class_names else dataset.class_names
+        if args.command == 'detect':
+            detections = model.detect([image], verbose=0, use_raw_mask=True)[0]
+            hidx = detections['scores'] > score_thresh
+            class_ids = detections['class_ids']
+            if args.catIds:
+                hidx &= np.in1d(class_ids, np.array(args.catIds))
+
+            scores = None if args.hide_scores else detections['scores'][hidx]
+            dt_colors = [all_colors[class_ids[hidx][_]] for _ in range(np.sum(hidx))]
+            visualize_mini.display_minimasks(image, detections['rois'][hidx], detections['masks'][:, :, hidx],
+                                             class_ids[hidx], class_names=class_names,
+                                             scores=scores, ax=ax, draw_boxes=False, colors=dt_colors,
+                                             title=title, mask_alpha=.0, mask_thresh=mask_thresh)
+        ax = plt.subplot(1, 2, 2)
+        plt.imshow(image)
+        # Show ground truth annotations on second subplot
+        gidx = np.ones_like(gt_class_id, dtype=np.bool)
+        if args.catIds:
+            gidx &= np.in1d(gt_class_id, np.array(args.catIds))
+        gt_colors = [all_gt_colors[_] for _ in gt_class_id[gidx]]
+        visualize_mini.display_minimasks(image, gt_bbox[gidx], gt_mask[:, :, gidx],
+                                         gt_class_id[gidx], class_names=class_names,
+                                         scores=None, ax=ax, draw_boxes=False, colors=gt_colors,
+                                         title=title, mask_alpha=.0, mask_thresh=mask_thresh)
+        plt.savefig('%s/%s_%s' % (args.visualize_outdir, args.command,
+                                  os.path.split(dataset.image_info[image_id]['path'])[1]))
+        plt.close()
 
 def evaluate_coco(model, dataset, coco, eval_type="bbox", limit=0, image_ids=None):
     """Runs official COCO evaluation.
@@ -428,6 +472,10 @@ if __name__ == '__main__':
                         metavar="<True|False>",
                         help='Automatically download and unzip MS-COCO files (default=False)',
                         type=bool)
+    parser.add_argument('--data_type', requried=False,
+                        default=None,
+                        help='override the subdir of coco to use')
+
     args = parser.parse_args()
     print("Command: ", args.command)
     print("Model: ", args.model)
@@ -524,6 +572,7 @@ if __name__ == '__main__':
     elif args.command == "evaluate":
         # Validation dataset
         dataset_val = CocoDataset()
+
         val_type = "val" if args.year in '2017' else "minival"
         coco = dataset_val.load_coco(args.dataset, val_type, year=args.year, return_coco=True, auto_download=args.download)
         dataset_val.prepare()
