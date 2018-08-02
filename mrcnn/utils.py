@@ -392,6 +392,13 @@ class Dataset(object):
         class_ids = np.empty([0], np.int32)
         return mask, class_ids
 
+    def make_semantic_classes(self, image_shape, masks):
+        """
+        loads a dictionary of semantic segmentation class integers
+        """
+        semantic_classes = None
+        info = dict(num_classes_each_channel= None)
+        return semantic_classes, info
 
 def resize_image(image, min_dim=None, max_dim=None, min_scale=None, mode="square"):
     """Resizes an image keeping the aspect ratio unchanged.

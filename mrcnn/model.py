@@ -49,6 +49,10 @@ def log(text, array=None):
             array.dtype))
     print(text)
 
+def keras_idx_rank3of3(_channel):
+    def func(_tensor):
+        return _tensor[:, :, :_channel]
+    return func
 
 class BatchNorm(KL.BatchNormalization):
     """Extends the Keras BatchNormalization class to allow a central place
@@ -1186,6 +1190,39 @@ def mrcnn_mask_loss_graph(target_masks, target_class_ids, pred_masks):
     return loss
 
 
+
+
+def focal_loss(labels, logits, num_classes=None, logits_softmax_axis=3, gamma=2.0, alpha=None):
+    """
+    TODO test this
+    returns focal loss, with shape equal to labels
+    """
+    if num_classes is None:
+        num_classes = logits.shape[logits_softmax_axis]
+    if alpha is None:
+        alpha = np.ones(shape=[num_classes])
+    probs = K.softmax(logits, axis=logits_softmax_axis)
+    best_probs = K.gather(probs, indices=labels, axis=logits_softmax_axis)
+    best_alphas = K.gather(alpha, indices=labels, axis=0)
+    return best_alphas * ((1 - best_probs) ** gamma) * K.log(best_probs)
+
+
+def mrcnn_sem_id_loss_graph(gt_sem_BHW, logit_BHWC, loss_type='truncated_softmax'):
+    """
+    Semantic classifications.
+    TODO: implement focal loss
+    """
+
+    if loss_type == 'truncated_softmax':
+        loss = K.sparse_categorical_crossentropy(gt_sem_BHW, logit_BHWC, from_logits=True)
+        loss = K.maximum(loss, -np.log(0.95))
+    elif loss_type == 'focal_loss':
+        loss = focal_loss(gt_sem_BHW, logit_BHWC, logits_softmax_axis=3, gamma=2.0, alpha=None)
+    else:
+        raise NotImplementedError('Unknown sem id loss type: %s' % loss_type)
+    loss = K.mean(loss)
+    return loss
+
 ############################################################
 #  Data Generator
 ############################################################
@@ -1217,6 +1254,7 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
     # Load image and mask
     image = dataset.load_image(image_id)
     mask, class_ids = dataset.load_mask(image_id)
+    sem_ids, sem_ids_info = dataset.make_semantic_classes(image.shape, mask) # semantic segmentation, multichannel, integer classes
     original_shape = image.shape
     image, window, scale, padding, crop = utils.resize_image(
         image,
@@ -1225,7 +1263,8 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
         max_dim=config.IMAGE_MAX_DIM,
         mode=config.IMAGE_RESIZE_MODE)
     mask = utils.resize_mask(mask, scale, padding, crop)
-
+    if sem_ids is not None:
+        sem_ids = utils.resize_mask(sem_ids, scale, padding, crop)
     # Random horizontal flips.
     # TODO: will be removed in a future update in favor of augmentation
     if augment:
@@ -1259,6 +1298,12 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
         # Change mask to np.uint8 because imgaug doesn't support np.bool
         mask = det.augment_image(mask.astype(np.uint8),
                                  hooks=imgaug.HooksImages(activator=hook))
+        # same as mask
+        # assert sem_ids.max() <= 255
+        # assert sem_ids.max() >= 0
+        if sem_ids is not None:
+            sem_ids = det.augment_image(sem_ids.astype(np.uint8),
+                                        hooks=imgaug.HooksImages(activator=hook))
         # Verify that shapes didn't change
         assert image.shape == image_shape, "Augmentation shouldn't change image size"
         assert mask.shape == mask_shape, "Augmentation shouldn't change mask size"
@@ -1290,6 +1335,8 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
     image_meta = compose_image_meta(image_id, original_shape, image.shape,
                                     window, scale, active_class_ids)
 
+    if sem_ids is not None:
+        return image, image_meta, class_ids, bbox, mask, [sem_ids, sem_ids_info]
     return image, image_meta, class_ids, bbox, mask
 
 
@@ -1706,15 +1753,22 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
 
             # If the image source is not to be augmented pass None as augmentation
             if dataset.image_info[image_id]['source'] in no_augmentation_sources:
-                image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
-                load_image_gt(dataset, config, image_id, augment=augment,
-                              augmentation=None,
-                              use_mini_mask=config.USE_MINI_MASK)
+                image_gt_retval =\
+                    load_image_gt(dataset, config, image_id, augment=augment,
+                                  augmentation=None,
+                                  use_mini_mask=config.USE_MINI_MASK)
             else:
-                image, image_meta, gt_class_ids, gt_boxes, gt_masks = \
+                 image_gt_retval =\
                     load_image_gt(dataset, config, image_id, augment=augment,
                                 augmentation=augmentation,
                                 use_mini_mask=config.USE_MINI_MASK)
+            if len(image_gt_retval) == 5:
+                image, image_meta, gt_class_ids, gt_boxes, gt_masks = image_gt_retval
+                gt_sem_ids, sem_ids_info = None, None
+            elif len(image_gt_retval) == 6:
+                image, image_meta, gt_class_ids, gt_boxes, gt_masks, [gt_sem_ids, sem_ids_info] = image_gt_retval
+            else:
+                raise ValueError("image_gt_retval is too long (%d)" % len(image_gt_retval))
 
             # Skip images that have no instances. This can happen in cases
             # where we train on a subset of classes and the image doesn't
@@ -1752,6 +1806,9 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
                 batch_gt_masks = np.zeros(
                     (batch_size, gt_masks.shape[0], gt_masks.shape[1],
                      config.MAX_GT_INSTANCES), dtype=gt_masks.dtype)
+                if gt_sem_ids is not None:
+                    batch_sem_ids = np.zeros(
+                        (batch_size,) + gt_sem_ids.shape, dtype=np.uint8)
                 if random_rois:
                     batch_rpn_rois = np.zeros(
                         (batch_size, rpn_rois.shape[0], 4), dtype=rpn_rois.dtype)
@@ -1778,9 +1835,11 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
             batch_rpn_match[b] = rpn_match[:, np.newaxis]
             batch_rpn_bbox[b] = rpn_bbox
             batch_images[b] = mold_image(image.astype(np.float32), config)
-            batch_gt_class_ids[b, :gt_class_ids.shape[0]] = gt_class_ids
             batch_gt_boxes[b, :gt_boxes.shape[0]] = gt_boxes
             batch_gt_masks[b, :, :, :gt_masks.shape[-1]] = gt_masks
+            if gt_sem_ids is not None:
+                batch_sem_ids[b] = gt_sem_ids
+            batch_gt_class_ids[b, :gt_class_ids.shape[0]] = gt_class_ids
             if random_rois:
                 batch_rpn_rois[b] = rpn_rois
                 if detection_targets:
@@ -1795,6 +1854,9 @@ def data_generator(dataset, config, shuffle=True, augment=False, augmentation=No
                 inputs = [batch_images, batch_image_meta, batch_rpn_match, batch_rpn_bbox,
                           batch_gt_class_ids, batch_gt_boxes, batch_gt_masks]
                 outputs = []
+
+                if gt_sem_ids is not None:
+                    inputs.extend([batch_sem_ids])
 
                 if random_rois:
                     inputs.extend([batch_rpn_rois])
@@ -1908,7 +1970,7 @@ class MaskRCNN():
             _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE,
                                              stage5=True, train_bn=config.TRAIN_BN)
         # Top-down Layers
-        # TODO: add assert to varify feature map sizes match what's in config
+        # TODO: add assert to verify feature map sizes match what's in config
         P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c5p5')(C5)
         P4 = KL.Add(name="fpn_p4add")([
             KL.UpSampling2D(size=(2, 2), name="fpn_p5upsampled")(P5),
@@ -1942,7 +2004,7 @@ class MaskRCNN():
             anchors = KL.Lambda(lambda x: tf.Variable(anchors), name="anchors")(input_image)
         else:
             anchors = input_anchors
-
+        
         # RPN Model
         rpn = build_rpn_model(config.RPN_ANCHOR_STRIDE,
                               len(config.RPN_ANCHOR_RATIOS), config.TOP_DOWN_PYRAMID_SIZE)
@@ -1960,6 +2022,14 @@ class MaskRCNN():
                    for o, n in zip(outputs, output_names)]
 
         rpn_class_logits, rpn_class, rpn_bbox = outputs
+        
+        # TODO: alternative to hard-coding the effective stride for P2, which is (4, 4) for resnet 101?
+        if config.NUM_SEMANTIC_ID_CHANNELS > 0:
+            _block_size, _block_elems, = 4, 16
+            PS0 = KL.Conv2D((config.TOP_DOWN_PYRAMID_SIZE // _block_elems) * _block_elems, (1, 1), padding="SAME", name="semantic_p2_conv")(P2)
+            PS0 = KL.Lambda(lambda x: tf.depth_to_space(x, block_size=_block_size), name="semantic_upsampled")(PS0)
+            mrcnn_sem_logits = [KL.Conv2D(_num_sem_classes, (1, 1), padding="SAME", name="semantic_logits_%d" % s)(PS0) for 
+                                s, _num_sem_classes in enumerate(config.NUM_CLASSES_EACH_SEMANTIC_CHANNEL)]
 
         # Generate proposals
         # Proposals are [batch, N, (y1, x1, y2, x2)] in normalized coordinates
@@ -1979,6 +2049,9 @@ class MaskRCNN():
                 lambda x: parse_image_meta_graph(x)["active_class_ids"]
                 )(input_image_meta)
 
+            if config.NUM_SEMANTIC_ID_CHANNELS > 0:
+                input_sem_ids = KL.Input(shape=[None, None, config.NUM_SEMANTIC_ID_CHANNELS], 
+                                         name="input_sem_ids", dtype=np.int32)
             if not config.USE_RPN_ROIS:
                 # Ignore predicted ROIs and use ROIs provided as an input.
                 input_rois = KL.Input(shape=[config.POST_NMS_ROIS_TRAINING, 4],
@@ -2011,7 +2084,7 @@ class MaskRCNN():
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
-            # TODO: clean up (use tf.identify if necessary)
+            # TODO: clean up (use tf.identity if necessary)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
 
             # Losses
@@ -2035,6 +2108,17 @@ class MaskRCNN():
                        mrcnn_class_logits, mrcnn_class, mrcnn_bbox, mrcnn_mask,
                        rpn_rois, output_rois,
                        rpn_class_loss, rpn_bbox_loss, class_loss, bbox_loss, mask_loss]
+            if config.NUM_SEMANTIC_ID_CHANNELS > 0:
+                inputs.append(input_sem_ids)
+                sem_id_losses = []
+                
+                for s, mrcnn_sem_logit_1c in enumerate(mrcnn_sem_logits):
+                    curr_sem_ids = KL.Lambda(lambda x: keras_idx_rank3of3(s)(x))(input_sem_ids) # input_sem_ids[:, :, :, s]
+                    print(s, curr_sem_ids, curr_sem_ids)
+                    sem_id_loss_1c = KL.Lambda(lambda x: mrcnn_sem_id_loss_graph(*x), name = 'sem_id_loss_1c_%d' % s)(
+                        [curr_sem_ids, mrcnn_sem_logit_1c])
+                    sem_id_losses.append(sem_id_loss_1c)
+                outputs.extend(sem_id_losses)  
             model = KM.Model(inputs, outputs, name='mask_rcnn')
         else:
             # Network Heads
@@ -2158,9 +2242,12 @@ class MaskRCNN():
                                 md5_hash='a268eb855778b3df3c7506639542a6af')
         return weights_path
 
-    def compile(self, learning_rate, momentum):
+    def compile(self, learning_rate, momentum, additional_loss_names=None):
         """Gets the model ready for training. Adds losses, regularization, and
         metrics. Then calls the Keras compile() function.
+        loss_names = [
+            "rpn_class_loss",  "rpn_bbox_loss",
+            "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
         """
         # Optimizer object
         optimizer = keras.optimizers.SGD(
@@ -2173,6 +2260,8 @@ class MaskRCNN():
         loss_names = [
             "rpn_class_loss",  "rpn_bbox_loss",
             "mrcnn_class_loss", "mrcnn_bbox_loss", "mrcnn_mask_loss"]
+        if additional_loss_names is not None:
+            loss_names.extend(additional_loss_names)
         for name in loss_names:
             layer = self.keras_model.get_layer(name)
             if layer.output in self.keras_model.losses:

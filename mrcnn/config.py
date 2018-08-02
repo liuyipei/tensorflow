@@ -167,6 +167,9 @@ class Config(object):
     # Non-maximum suppression threshold for detection
     DETECTION_NMS_THRESHOLD = 0.3
 
+    NUM_SEMANTIC_ID_CHANNELS = 0
+    NUM_CLASSES_EACH_SEMANTIC_CHANNEL = tuple()
+
     # Learning rate and momentum
     # The Mask RCNN paper uses lr=0.02, but on TensorFlow it causes
     # weights to explode. Likely due to differences in optimizer
